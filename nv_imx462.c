@@ -37,6 +37,7 @@
 #include <linux/module.h>
 #include <linux/seq_file.h>
 #include <linux/of.h>
+#include <media/v4l2-ctrls.h>
 #include <linux/of_device.h>
 #include <linux/of_gpio.h>
 
@@ -110,6 +111,11 @@ struct imx462 {
 	struct camera_common_data *s_data;
 	struct tegracam_device *tc_dev;
 	enum imx462_Config config;
+	/* White balance controls (extra V4L2 standard CIDs). */
+	struct v4l2_ctrl_handler wb_handler;
+	struct v4l2_ctrl *red_balance;
+	struct v4l2_ctrl *blue_balance;
+	struct v4l2_ctrl *auto_white_balance;
 };
 
 static const struct regmap_config sensor_regmap_config = {
@@ -207,6 +213,7 @@ static int imx462_write_table(struct imx462 *priv, const imx462_reg table[])
  *   0x0300  RESOLUTION_INDEX  selects sensor mode (0 = default)
  */
 #define PIVARIETY_STREAM_ON_REG       0x0100
+#define PIVARIETY_SYSTEM_IDLE_REG     0x0107
 #define PIVARIETY_RESOLUTION_INDEX    0x0300
 
 static int pivariety_write_u32(struct i2c_client *client, u16 reg, u32 val)
@@ -223,6 +230,75 @@ static int pivariety_write_u32(struct i2c_client *client, u16 reg, u32 val)
 
 	ret = i2c_master_send(client, buf, 6);
 	return (ret == 6) ? 0 : -EIO;
+}
+
+static int pivariety_read_u32(struct i2c_client *client, u16 reg, u32 *val)
+{
+	u8 addr[2] = { (reg >> 8) & 0xff, reg & 0xff };
+	u8 buf[4] = { 0 };
+	int ret;
+
+	ret = i2c_master_send(client, addr, 2);
+	if (ret != 2)
+		return -EIO;
+
+	ret = i2c_master_recv(client, buf, 4);
+	if (ret != 4)
+		return -EIO;
+
+	*val = ((u32)buf[0] << 24) | ((u32)buf[1] << 16) |
+	       ((u32)buf[2] <<  8) |  (u32)buf[3];
+	return 0;
+}
+
+/*
+ * The Arducam MCU is busy for a few ms after each register write
+ * because it has to actually push the change to the Sony IMX462 over
+ * its own internal I2C link. SYSTEM_IDLE_REG (0x0107) reads non-zero
+ * when the MCU is ready for the next command. We poll it before doing
+ * anything important. Without this, fast back-to-back writes can be
+ * dropped and the sensor never starts streaming.
+ */
+static int pivariety_wait_idle(struct i2c_client *client)
+{
+	u32 val = 0;
+	int i;
+
+	for (i = 0; i < 20; i++) {
+		if (pivariety_read_u32(client, PIVARIETY_SYSTEM_IDLE_REG, &val) == 0 && val)
+			return 0;
+		usleep_range(1000, 2000);
+	}
+	dev_warn(&client->dev, "B0444: MCU did not report IDLE after 20 polls\n");
+	return -ETIMEDOUT;
+}
+
+/* Pivariety CTRL register slots, used to set V4L2-style controls
+ * on the MCU. Workflow: write CTRL_ID_REG with the V4L2 CID, then
+ * write CTRL_VALUE_REG with the value, with a wait_idle between. */
+#define PIVARIETY_CTRL_ID_REG     0x0401
+#define PIVARIETY_CTRL_VALUE_REG  0x0406
+
+static int pivariety_set_ctrl(struct i2c_client *client, u32 cid, s32 val)
+{
+	int err;
+
+	pivariety_wait_idle(client);
+	err = pivariety_write_u32(client, PIVARIETY_CTRL_ID_REG, cid);
+	if (err) {
+		dev_err(&client->dev, "B0444: CTRL_ID write failed (cid=0x%x): %d\n",
+			cid, err);
+		return err;
+	}
+	pivariety_wait_idle(client);
+	err = pivariety_write_u32(client, PIVARIETY_CTRL_VALUE_REG, (u32)val);
+	if (err) {
+		dev_err(&client->dev, "B0444: CTRL_VALUE write failed (val=%d): %d\n",
+			val, err);
+		return err;
+	}
+	pivariety_wait_idle(client);
+	return 0;
 }
 
 
@@ -716,16 +792,19 @@ static int imx462_start_streaming(struct tegracam_device *tc_dev)
 	struct imx462 *priv = (struct imx462 *)tegracam_get_privdata(tc_dev);
 	int err;
 
-	dev_info(tc_dev->dev, "B0444: sending Pivariety STREAM_ON\n");
+	dev_info(tc_dev->dev, "B0444: starting stream\n");
 
-	/* B0444 patch: send STREAM_ON to Arducam MCU bridge.
-	 * The MCU handles all sensor configuration internally. */
+	/* Make sure the MCU is not busy from a previous command. */
+	pivariety_wait_idle(priv->i2c_client);
+
 	err = pivariety_write_u32(priv->i2c_client, PIVARIETY_STREAM_ON_REG, 1);
 	if (err) {
-		dev_err(tc_dev->dev, "B0444: Pivariety STREAM_ON write failed: %d\n", err);
+		dev_err(tc_dev->dev, "B0444: STREAM_ON write failed: %d\n", err);
 		return err;
 	}
 
+	/* Give the MCU a tick to actually kick the sensor. */
+	pivariety_wait_idle(priv->i2c_client);
 	return 0;
 }
 
@@ -733,8 +812,10 @@ static int imx462_stop_streaming(struct tegracam_device *tc_dev)
 {
 	struct imx462 *priv = (struct imx462 *)tegracam_get_privdata(tc_dev);
 
-	dev_info(tc_dev->dev, "B0444: sending Pivariety STREAM_OFF\n");
+	dev_info(tc_dev->dev, "B0444: stopping stream\n");
+	pivariety_wait_idle(priv->i2c_client);
 	pivariety_write_u32(priv->i2c_client, PIVARIETY_STREAM_ON_REG, 0);
+	pivariety_wait_idle(priv->i2c_client);
 	return 0;
 }
 
@@ -752,6 +833,90 @@ static struct camera_common_sensor_ops imx462_common_ops = {
 	.start_streaming = imx462_start_streaming,
 	.stop_streaming = imx462_stop_streaming,
 };
+
+
+/* Callback fired by v4l2-ctl when the user writes one of our extra
+ * white-balance controls. We just forward the value to the Arducam
+ * MCU using the Pivariety control protocol. */
+static int imx462_wb_s_ctrl(struct v4l2_ctrl *ctrl)
+{
+	struct imx462 *priv = container_of(ctrl->handler, struct imx462, wb_handler);
+	u32 cid_remote = 0;
+
+	switch (ctrl->id) {
+	case V4L2_CID_RED_BALANCE:
+		cid_remote = V4L2_CID_RED_BALANCE;
+		break;
+	case V4L2_CID_BLUE_BALANCE:
+		cid_remote = V4L2_CID_BLUE_BALANCE;
+		break;
+	case V4L2_CID_AUTO_WHITE_BALANCE:
+		cid_remote = V4L2_CID_AUTO_WHITE_BALANCE;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	dev_dbg(&priv->i2c_client->dev,
+		"B0444: wb set cid=0x%x val=%d\n", cid_remote, ctrl->val);
+	return pivariety_set_ctrl(priv->i2c_client, cid_remote, ctrl->val);
+}
+
+static const struct v4l2_ctrl_ops imx462_wb_ctrl_ops = {
+	.s_ctrl = imx462_wb_s_ctrl,
+};
+
+/* Install the extra white-balance V4L2 controls so userspace can tune
+ * with `v4l2-ctl -c red_balance=1550` and friends. We add them to a
+ * second ctrl_handler that hangs off our private struct (kept separate
+ * from the Tegracam-owned handler so we don't fight it). */
+static int imx462_init_wb_controls(struct imx462 *priv)
+{
+	struct v4l2_subdev *sd = priv->subdev;
+	int err;
+
+	err = v4l2_ctrl_handler_init(&priv->wb_handler, 3);
+	if (err) {
+		dev_err(&priv->i2c_client->dev,
+			"B0444: wb handler init failed: %d\n", err);
+		return err;
+	}
+
+	priv->red_balance = v4l2_ctrl_new_std(&priv->wb_handler,
+		&imx462_wb_ctrl_ops, V4L2_CID_RED_BALANCE,
+		0, 4000, 1, 1500);
+	priv->blue_balance = v4l2_ctrl_new_std(&priv->wb_handler,
+		&imx462_wb_ctrl_ops, V4L2_CID_BLUE_BALANCE,
+		0, 4000, 1, 1500);
+	priv->auto_white_balance = v4l2_ctrl_new_std(&priv->wb_handler,
+		&imx462_wb_ctrl_ops, V4L2_CID_AUTO_WHITE_BALANCE,
+		0, 1, 1, 0);
+
+	if (priv->wb_handler.error) {
+		err = priv->wb_handler.error;
+		dev_err(&priv->i2c_client->dev,
+			"B0444: failed to add wb controls: %d\n", err);
+		v4l2_ctrl_handler_free(&priv->wb_handler);
+		return err;
+	}
+
+	/* Chain our handler onto the subdev so v4l2-ctl can see the new
+	 * controls alongside the gain/exposure ones from Tegracam. */
+	if (sd->ctrl_handler) {
+		err = v4l2_ctrl_add_handler(sd->ctrl_handler,
+			&priv->wb_handler, NULL, true);
+		if (err) {
+			dev_warn(&priv->i2c_client->dev,
+				"B0444: could not chain wb handler: %d\n", err);
+		}
+	} else {
+		sd->ctrl_handler = &priv->wb_handler;
+	}
+
+	dev_info(&priv->i2c_client->dev,
+		"B0444: white balance controls ready (red_balance, blue_balance, auto_white_balance)\n");
+	return 0;
+}
 
 static int imx462_board_setup(struct imx462 *priv)
 {
@@ -842,6 +1007,9 @@ static int imx462_probe(struct i2c_client *client,
 		dev_err(dev, "tegra camera subdev registration failed\n");
 		return err;
 	}
+
+	/* Install our extra V4L2 white-balance controls. */
+	imx462_init_wb_controls(priv);
 
 	dev_dbg(dev, "detected imx462 sensor\n");
 

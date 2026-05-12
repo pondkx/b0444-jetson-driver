@@ -98,22 +98,39 @@ python3 view_raw.py frame.raw
 
 Or convert to PNG with the small script in `samples/`.
 
+
+## Watch live video
+
+The repo ships a Python live viewer:
+
+```
+sudo -u x bash -c "DISPLAY=:0 XAUTHORITY=/run/user/1000/gdm/Xauthority python3 imx462_live.py"
+```
+
+It opens fullscreen on the Jetson HDMI screen, shows a frame counter
+and FPS, and auto-stretches dim sensor data so you can actually see
+what is going on. Press `q` in the window to quit. Runs at about 4 fps
+because the debayer is done on the CPU. A CUDA debayer would push it
+to 30 fps but that is future work.
+
+If your HDMI is unreliable (mine is), use the UDP streaming scripts in
+`streaming/` instead to watch the camera on another computer on the
+same LAN. See `streaming/README.md` for the one-line setup.
+
 ## What still needs work
 
-The current driver only exposes these v4l2 controls: `gain`,
-`exposure`, `frame_rate`, `horizontal_flip`, `vertical_flip`. To get
-nice colors the driver also needs `red_balance`, `blue_balance` and
-`white_balance_automatic` so we can tell the Arducam MCU to adjust
-white balance. Without it the picture looks green under fluorescent
-lights.
-
-The next step is to add those controls and pass them through to the
-MCU using the Pivariety control protocol (`CTRL_ID_REG` 0x0401 and
-`CTRL_VALUE_REG` 0x0406).
-
-There is also no ISP tuning file for this sensor on Jetson. So
-`nvarguscamerasrc` does not work. The driver works only through raw
-V4L2 right now.
+- The MCU on the B0444 may not implement every V4L2 control we expose.
+  In my testing the WB writes go through but the visible effect is
+  small. A nicer driver would query `CTRL_INDEX_REG` at probe time and
+  only register the controls the MCU actually answers for. Same for
+  exposure and gain - they probably need to be routed through
+  Pivariety set_ctrl too rather than the Tegracam-default path.
+- There is no ISP tuning file for this sensor on Jetson, so
+  `nvarguscamerasrc` does not work. Use the raw V4L2 path instead.
+- Only `cam0` is wired up in the device tree right now.
+- The live viewer does software debayer on the CPU (~4 fps). A GPU
+  debayer using NVIDIA NPP or RidgeRun's `rrcudadebayer` would push
+  this to 30 fps.
 
 ## Sample picture
 
@@ -130,6 +147,18 @@ Original repo: https://github.com/Kurokesu/imx462-jetson-driver
 
 Without their work this would have taken weeks of kernel hacking
 instead of a few hours of patching.
+
+## Changelog
+
+- **v0.2.0** - Added `wait_idle` + `read_u32` MCU helpers (fixes
+  first-capture-after-boot failures). Added white balance V4L2
+  controls (`red_balance`, `blue_balance`, `white_balance_automatic`)
+  wired through the Pivariety CTRL_ID / CTRL_VALUE protocol. Added
+  `imx462_live.py` live viewer and UDP streaming scripts in
+  `streaming/`.
+- **v0.1.0** - Initial fork of Kurokesu's IMX462 driver. Three patches
+  so the same code works with the Arducam B0444 MCU bridge instead of
+  a bare Sony sensor.
 
 ## License
 

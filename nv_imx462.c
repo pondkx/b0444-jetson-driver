@@ -365,6 +365,13 @@ fail:
 	return err;
 }
 
+/*
+ * v0.3.0: this used to write a Sony native GAIN register (0x3014) via
+ * imx462_get_gain_reg() + imx462_write_reg(). On the B0444 the MCU
+ * bridge swallows those Sony writes silently, so the sensor never
+ * actually changed gain. Re-routed the call to pivariety_set_ctrl()
+ * so the v4l2 `gain` knob actually reaches the MCU.
+ */
 static int imx462_set_gain(struct tegracam_device *tc_dev, s64 val)
 {
 	struct imx462 *priv = (struct imx462 *)tc_dev->priv;
@@ -435,6 +442,12 @@ static int imx462_set_frame_rate(struct tegracam_device *tc_dev, s64 val)
 	return err;
 }
 
+/*
+ * v0.3.0: same story as set_gain — the original code wrote SHS1
+ * (0x3020) via imx462_set_coarse_time(), which the MCU bridge does not
+ * implement. Re-routed to pivariety_set_ctrl(V4L2_CID_EXPOSURE) so the
+ * v4l2 `exposure` knob has a real effect.
+ */
 static int imx462_set_exposure(struct tegracam_device *tc_dev, s64 val)
 {
 	struct imx462 *priv = (struct imx462 *)tc_dev->priv;

@@ -108,29 +108,68 @@ sudo -u x bash -c "DISPLAY=:0 XAUTHORITY=/run/user/1000/gdm/Xauthority python3 i
 ```
 
 It opens fullscreen on the Jetson HDMI screen, shows a frame counter
-and FPS, and auto-stretches dim sensor data so you can actually see
-what is going on. Press `q` in the window to quit. Runs at about 4 fps
-because the debayer is done on the CPU. A CUDA debayer would push it
-to 30 fps but that is future work.
+and FPS, white-patch white balance, saturation boost, and a live Bayer
+pattern cycler. Press `q` in the window to quit. Runs at about
+**40 fps with ~25 ms latency** on the Orin Nano CPU. Three things make
+it fast:
+
+- A reader thread always grabs the freshest v4l2 frame and drops stale
+  ones, so the main loop never processes a buffer that's older than
+  one frame.
+- White balance and percentile-stretch math live in a side thread that
+  refreshes ~1.5 Hz, and the main loop drifts smoothly toward the new
+  values 2% per frame so colours don't strobe.
+- Debayer is a half-resolution numpy stride trick instead of
+  `cv2.cvtColor`, then upscaled at the very end with `cv2.resize` to
+  whatever size your HDMI monitor is actually running at (detected via
+  `xrandr` at startup).
+
+You can also drive the viewer over SSH (no keyboard needed on the
+Jetson) by echoing letters into `/tmp/imx462_ctl`:
+
+```
+echo b > /tmp/imx462_ctl    # cycle Bayer pattern
+echo w > /tmp/imx462_ctl    # toggle WB on/off
+echo + > /tmp/imx462_ctl    # +0.5 saturation
+echo - > /tmp/imx462_ctl    # -0.5 saturation
+echo s > /tmp/imx462_ctl    # save snapshot to /tmp/imx462_snap.png
+echo q > /tmp/imx462_ctl    # quit
+```
 
 If your HDMI is unreliable (mine is), use the UDP streaming scripts in
 `streaming/` instead to watch the camera on another computer on the
 same LAN. See `streaming/README.md` for the one-line setup.
 
+### About the colours
+
+The B0444 ships without an IR-cut filter — that is by design, Arducam
+sells it as a low-light/NIR-sensitive module. The IMX462's organic
+colour filters are nearly transparent to near-infrared, so under normal
+indoor light every surface picks up some IR and the picture comes out
+with a pink/magenta wash. Skin reads pinker than it is, plants and
+fabric shift toward red/purple, white LEDs read greener than they look
+to your eye. No software white balance can fully undo this because the
+information is mixed in before the sensor sees it. The proper fix is a
+$5 M12 UV/IR-cut filter screwed in between the lens and the sensor.
+
 ## What still needs work
 
-- The MCU on the B0444 may not implement every V4L2 control we expose.
-  In my testing the WB writes go through but the visible effect is
-  small. A nicer driver would query `CTRL_INDEX_REG` at probe time and
-  only register the controls the MCU actually answers for. Same for
-  exposure and gain - they probably need to be routed through
-  Pivariety set_ctrl too rather than the Tegracam-default path.
+- The MCU on the B0444 firmware does not seem to implement every V4L2
+  control. WB writes go through but the visible effect is small. A
+  nicer driver would walk `CTRL_INDEX_REG` at probe time and only
+  register the controls the MCU answers for.
+- `set_frame_rate` still writes Sony native VMAX registers that the
+  MCU ignores (same bug the exposure/gain fix in v0.3.0 solved). Easy
+  follow-up: route it through `pivariety_set_ctrl(V4L2_CID_FRAMERATE)`.
 - There is no ISP tuning file for this sensor on Jetson, so
   `nvarguscamerasrc` does not work. Use the raw V4L2 path instead.
 - Only `cam0` is wired up in the device tree right now.
-- The live viewer does software debayer on the CPU (~4 fps). A GPU
-  debayer using NVIDIA NPP or RidgeRun's `rrcudadebayer` would push
-  this to 30 fps.
+- For real-time use without an IR-cut filter, the colours will be
+  pinkish in visible light. A $5 M12 UV/IR-cut filter is the proper
+  hardware fix; a CCM in the viewer is the software band-aid.
+- The viewer hits ~40 fps on CPU. A CUDA debayer (NVIDIA NPP or
+  RidgeRun's `rrcudadebayer`) would push that to 100+ fps but needs an
+  OpenCV-CUDA rebuild on the Jetson.
 
 ## Sample picture
 
@@ -150,6 +189,14 @@ instead of a few hours of patching.
 
 ## Changelog
 
+- **v0.3.0** - Routed Tegracam's `set_exposure` / `set_gain` through
+  `pivariety_set_ctrl()` so the v4l2 exposure / gain dials actually
+  reach the MCU bridge instead of writing dead Sony registers. Rewrote
+  the live viewer to use a reader thread (latest-frame-only),
+  side-thread WB/p99 stats, half-resolution numpy debayer, gamma LUT,
+  and `xrandr` screen-size detection: 3-5 fps + 600 ms lag became
+  40 fps + 25 ms lag. Added a `/tmp/imx462_ctl` command channel so the
+  viewer is fully SSH-drivable.
 - **v0.2.0** - Added `wait_idle` + `read_u32` MCU helpers (fixes
   first-capture-after-boot failures). Added white balance V4L2
   controls (`red_balance`, `blue_balance`, `white_balance_automatic`)

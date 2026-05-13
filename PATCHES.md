@@ -155,3 +155,81 @@ usable in practice:
 Together these let you tune the camera controls from one terminal
 while watching the output from another room without ever risking
 the Jetson HDMI compositor.
+
+
+# More patches (added in v0.3.0)
+
+## Patch 7: route Tegracam set_exposure / set_gain through the MCU
+
+The Tegracam framework calls a callback when userspace sets `exposure`
+or `gain`. The callback Kurokesu shipped writes Sony native registers
+(SHS1 at 0x3020 for exposure, GAIN at 0x3014 for analog gain). On the
+B0444 those writes go to the MCU bridge which does not implement Sony's
+register set — the writes are silently swallowed, and the sensor never
+actually changes its gain or exposure.
+
+We discovered this when the picture stayed dim in a bright room even
+after maxing the `gain` and `exposure` v4l2 controls. Confirmation was
+easy: `v4l2-ctl --set-ctrl=gain=295` did nothing visible on screen, but
+the same value written via the Pivariety `CTRL_ID_REG / CTRL_VALUE_REG`
+sequence (the same pattern we already used for white balance) made the
+image visibly brighter.
+
+Fix: replaced the bodies of `imx462_set_gain()` and
+`imx462_set_exposure()` so they call
+
+```
+pivariety_set_ctrl(priv->i2c_client, V4L2_CID_ANALOGUE_GAIN, val);
+pivariety_set_ctrl(priv->i2c_client, V4L2_CID_EXPOSURE,        val);
+```
+
+instead of writing dead Sony registers. The original Sony register
+helpers (`imx462_get_gain_reg`, `imx462_set_coarse_time`, etc.) are
+still in the file but no longer called — left there in case some
+future firmware build of the MCU exposes a raw register-write path.
+
+After this patch, `gain` and `exposure` actually change what the sensor
+does. Range is firmware-determined by the MCU (typically 0..295 and
+30..33275 line periods on this firmware).
+
+## Patch 8: live viewer rewrite for low latency
+
+The original `imx462_live.py` from v0.2.0 ran at 3-5 fps with about
+600 ms of lag, which the user described as "I see myself in the past
+when I wave my hand". Three independent problems:
+
+1. The `v4l2-ctl --stream-mmap` pipe was queuing ~4 buffers (130 ms)
+   before our Python loop pulled one.
+2. Each frame was running two `np.percentile` calls (white balance +
+   exposure stretch), each one sorting a 6-million-float array
+   (~150-250 ms each).
+3. `cv2.cvtColor(BayerXX2BGR)` on a full 1920x1080 image was ~50-80 ms
+   single-threaded on the Orin Nano CPU.
+
+Rewrote it to:
+
+- Run a **reader thread** that always overwrites a single "latest
+  frame" slot, so the main loop never processes a buffer older than
+  ~1 frame. Drops the 130 ms queue latency.
+- Run a **stats thread** that recomputes the WB scale and percentile
+  stretch every ~0.6 sec, then the main loop EMA-slides toward that
+  target 2% per frame. Recomputing only twice a second instead of every
+  frame is the single biggest CPU win, and the EMA fixes the original
+  flicker (when the brightest pixel in the frame moves to a different
+  object the WB used to snap and the whole picture pulsed magenta).
+- Replace `cv2.cvtColor` with a **half-resolution numpy stride
+  debayer** (pick R from R positions, B from B positions, average the
+  two G positions). Produces a 960x540 BGR uint16 image in ~5 ms
+  instead of ~60 ms.
+- Apply WB + stretch + gamma in one `cv2.convertScaleAbs` + `cv2.LUT`
+  pass per channel — all uint8, no float32 allocations.
+- Detect the actual HDMI resolution at startup with `xrandr` (the
+  user's monitor is 2560x1440, not 1920x1080 as we assumed) and
+  `cv2.resize` the 960x540 buffer up to fill the whole screen.
+- Add a `/tmp/imx462_ctl` named-file command channel so the viewer
+  can be driven over SSH without a keyboard attached to the Jetson
+  HDMI. Letters: `b` cycle Bayer, `w` toggle WB, `+`/`-` saturation,
+  `s` save snapshot, `q` quit.
+
+End result: ~40 fps with ~25 ms latency on the Orin Nano CPU, no GPU,
+no NVMM, no compositor risk.

@@ -367,28 +367,17 @@ fail:
 
 static int imx462_set_gain(struct tegracam_device *tc_dev, s64 val)
 {
-	struct camera_common_data *s_data = tc_dev->s_data;
-	struct device *dev = s_data->dev;
-	const struct sensor_mode_properties *mode =
-		&s_data->sensor_props.sensor_modes[s_data->mode_prop_idx];
-	imx462_reg reg_gain;
-	int err = 0;
-	u8 gain;
+	struct imx462 *priv = (struct imx462 *)tc_dev->priv;
+	struct device *dev = tc_dev->dev;
+	int err;
 
-	if (mode->control_properties.gain_factor == 0) {
-		dev_err(dev, "%s:error, gain_factor is 0\n", __func__);
-		return -EINVAL;
-	}
+	dev_dbg(dev, "%s: gain val=%lld -> MCU V4L2_CID_ANALOGUE_GAIN\n",
+		__func__, val);
 
-	/* translate value */
-	gain = val / 3;
-	dev_dbg(dev, "%s: gain reg: %d\n", __func__, gain);
-
-	imx462_get_gain_reg(&reg_gain, gain);
-
-	err = imx462_write_reg(s_data, reg_gain.addr, reg_gain.val);
+	err = pivariety_set_ctrl(priv->i2c_client, V4L2_CID_ANALOGUE_GAIN,
+				 (s32)val);
 	if (err)
-		dev_dbg(dev, "%s: GAIN control error\n", __func__);
+		dev_warn(dev, "%s: MCU gain write failed (%d)\n", __func__, err);
 
 	return err;
 }
@@ -450,13 +439,16 @@ static int imx462_set_exposure(struct tegracam_device *tc_dev, s64 val)
 {
 	struct imx462 *priv = (struct imx462 *)tc_dev->priv;
 	struct device *dev = tc_dev->dev;
-	int err = 0;
+	int err;
 
-	dev_dbg(dev, "%s: val: %lld\n", __func__, val);
+	dev_dbg(dev, "%s: exposure val=%lld -> MCU V4L2_CID_EXPOSURE\n",
+		__func__, val);
 
-	err = imx462_set_coarse_time(priv, val);
+	err = pivariety_set_ctrl(priv->i2c_client, V4L2_CID_EXPOSURE,
+				 (s32)val);
 	if (err)
-		dev_dbg(dev, "%s: error coarse time SHS1 override\n", __func__);
+		dev_warn(dev, "%s: MCU exposure write failed (%d)\n",
+			 __func__, err);
 
 	return err;
 }
